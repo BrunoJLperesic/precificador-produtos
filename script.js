@@ -721,70 +721,158 @@ function triggerDownload(content, filename, mimeType) {
 }
 
 /**
- * Importação de arquivo CSV (suporta separador ',' ou ';')
+ * Converte texto bruto (CSV com ',', CSV PT-BR com ';', TSV copiado com '\t' ou JSON)
+ * em uma lista de produtos validados.
  */
-function handleImportCSV(event) {
-  const file = event.target.files?.[0];
-  if (!file) return;
+function parseProductsFromText(rawText) {
+  const cleaned = String(rawText || '').replace(/^\uFEFF/, '').trim();
+  if (!cleaned) return [];
 
+  // Suporte caso o usuário cole ou importe um JSON
+  if (cleaned.startsWith('[')) {
+    try {
+      const arr = JSON.parse(cleaned);
+      if (Array.isArray(arr)) {
+        return arr.map((item, idx) =>
+          computeProductMetrics({
+            id: 'imp-' + Date.now() + '-' + idx,
+            sku: String(item.sku || ''),
+            precoFinal: Number(item.precoFinal) || 0,
+            precoInicial: Number(item.precoInicial) || 0,
+            pct12: item.pct12 !== undefined ? Number(item.pct12) : 12,
+            pct16: item.pct16 !== undefined ? Number(item.pct16) : 16,
+            embalagem: item.embalagem !== undefined ? Number(item.embalagem) : 0.2,
+            erpCusto: item.erpCusto !== undefined ? Number(item.erpCusto) : 2.15,
+            frete: item.frete !== undefined && item.frete !== null && item.frete !== '' ? Number(item.frete) : null
+          })
+        );
+      }
+    } catch (_) {
+      // Continua para o parser de linhas CSV/TSV
+    }
+  }
+
+  const lines = cleaned.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return [];
+
+  // Detecta automaticamente o separador: Tab ('\t'), Ponto-e-vírgula (';') ou Vírgula (',')
+  const firstLine = lines[0];
+  let delimiter = ',';
+  if (firstLine.includes('\t')) {
+    delimiter = '\t';
+  } else if (firstLine.includes(';')) {
+    delimiter = ';';
+  }
+
+  // Verifica se a primeira linha é cabeçalho (contém "SKU" ou "Preço")
+  const hasHeader = /sku|pre[cç]o/i.test(firstLine);
+  const startIdx = hasHeader ? 1 : 0;
+
+  const parseNum = (val) => {
+    if (val === undefined || val === null) return null;
+    const str = String(val).replace(/R\$/gi, '').trim();
+    if (str === '' || str === '—' || str === '-') return null;
+    // Se usa ',' como decimal (ex: Excel PT-BR ou TSV), converte para '.'
+    const normalized = delimiter === ';' || delimiter === '\t' ? str.replace(/\./g, '').replace(',', '.') : str.replace(',', '.');
+    const n = parseFloat(normalized);
+    return isNaN(n) ? null : n;
+  };
+
+  const imported = [];
+  for (let i = startIdx; i < lines.length; i++) {
+    const cols = lines[i].split(delimiter);
+    if (cols.length < 3) continue;
+
+    const sku = cols[0].trim();
+    const precoFinal = parseNum(cols[1]);
+    const precoInicial = parseNum(cols[2]);
+    if (!sku || precoFinal === null) continue;
+
+    const embalagem = cols[5] !== undefined && parseNum(cols[5]) !== null ? parseNum(cols[5]) : 0.2;
+    const erpCusto = cols[6] !== undefined && parseNum(cols[6]) !== null ? parseNum(cols[6]) : 2.15;
+    const frete = cols[7] !== undefined ? parseNum(cols[7]) : null;
+
+    imported.push(
+      computeProductMetrics({
+        id: 'imp-' + Date.now() + '-' + i + '-' + Math.random().toString(36).substring(2, 5),
+        sku,
+        precoFinal,
+        precoInicial: precoInicial || 0,
+        pct12: 12,
+        pct16: 16,
+        embalagem,
+        erpCusto,
+        frete
+      })
+    );
+  }
+
+  return imported;
+}
+
+function getSelectedImportMode() {
+  const checked = document.querySelector('input[name="import-mode"]:checked');
+  return checked ? checked.value : 'merge';
+}
+
+function applyImportedProducts(importedList) {
+  if (!importedList || importedList.length === 0) {
+    showToast('Não foi possível identificar produtos válidos nos dados enviados.');
+    return false;
+  }
+
+  const mode = getSelectedImportMode();
+  if (mode === 'replace') {
+    products = importedList;
+    showToast(`Lista substituída por ${importedList.length} produtos importados!`);
+  } else {
+    // Mesclar: adiciona novos itens evitando duplicatas exatas (mesmo SKU + mesmo Preço Final)
+    let addedCount = 0;
+    importedList.forEach((imp) => {
+      const exists = products.some(
+        (p) => String(p.sku) === String(imp.sku) && Math.abs(p.precoFinal - imp.precoFinal) < 0.001
+      );
+      if (!exists) {
+        products.push(imp);
+        addedCount++;
+      }
+    });
+    showToast(`${addedCount} novos produtos adicionados (${importedList.length - addedCount} já existiam)!`);
+  }
+
+  saveProductsToStorage();
+  renderHistoryTable();
+  renderCatalogKPIs();
+  closeImportModal();
+  switchTab('history');
+  return true;
+}
+
+function handleImportFile(file) {
+  if (!file) return;
   const reader = new FileReader();
   reader.onload = (e) => {
     const text = String(e.target?.result || '');
-    const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-    if (lines.length < 2) {
-      showToast('O arquivo CSV parece estar vazio ou sem linhas de dados.');
-      return;
-    }
-
-    const isSemicolon = lines[0].includes(';');
-    const delimiter = isSemicolon ? ';' : ',';
-
-    const parseNum = (val) => {
-      if (val === undefined || val === null || val.trim() === '') return null;
-      const normalized = isSemicolon ? val.trim().replace(',', '.') : val.trim();
-      const n = parseFloat(normalized);
-      return isNaN(n) ? null : n;
-    };
-
-    const imported = [];
-    for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(delimiter);
-      if (cols.length < 3) continue;
-
-      const sku = cols[0].trim();
-      const precoFinal = parseNum(cols[1]) || 0;
-      const precoInicial = parseNum(cols[2]) || 0;
-      const embalagem = cols[5] !== undefined ? parseNum(cols[5]) || 0 : 0.2;
-      const erpCusto = cols[6] !== undefined ? parseNum(cols[6]) || 0 : 2.15;
-      const frete = cols[7] !== undefined ? parseNum(cols[7]) : null;
-
-      imported.push(
-        computeProductMetrics({
-          id: 'imp-' + Date.now() + '-' + i,
-          sku,
-          precoFinal,
-          precoInicial,
-          pct12: 12,
-          pct16: 16,
-          embalagem,
-          erpCusto,
-          frete
-        })
-      );
-    }
-
-    if (imported.length > 0) {
-      products = imported;
-      saveProductsToStorage();
-      renderHistoryTable();
-      renderCatalogKPIs();
-      showToast(`${imported.length} produtos importados com sucesso!`);
-    } else {
-      showToast('Não foi possível identificar produtos válidos no CSV.');
-    }
-    event.target.value = '';
+    const imported = parseProductsFromText(text);
+    applyImportedProducts(imported);
   };
   reader.readAsText(file);
+}
+
+function openImportModal() {
+  const modal = document.getElementById('import-modal');
+  if (modal) {
+    modal.classList.remove('hidden');
+  }
+}
+
+function closeImportModal() {
+  const modal = document.getElementById('import-modal');
+  if (modal) {
+    modal.classList.add('hidden');
+  }
+  const textarea = document.getElementById('textarea-import-paste');
+  if (textarea) textarea.value = '';
 }
 
 // ============================================================================
@@ -952,7 +1040,67 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-export-csv').addEventListener('click', exportStandardCSV);
   document.getElementById('btn-export-excel-csv').addEventListener('click', exportExcelPtBrCSV);
   document.getElementById('btn-copy-table').addEventListener('click', copyTableToClipboard);
-  document.getElementById('input-import-csv').addEventListener('change', handleImportCSV);
+
+  // Eventos do Modal de Importação / Transferência entre Aparelhos
+  document.getElementById('btn-open-import-modal')?.addEventListener('click', openImportModal);
+  document.getElementById('btn-history-import')?.addEventListener('click', openImportModal);
+  document.getElementById('btn-close-import-modal')?.addEventListener('click', closeImportModal);
+
+  document.getElementById('import-modal')?.addEventListener('click', (e) => {
+    if (e.target.id === 'import-modal') closeImportModal();
+  });
+
+  // Alternância visual dos cards de modo (Mesclar vs Substituir)
+  document.querySelectorAll('input[name="import-mode"]').forEach((radio) => {
+    radio.addEventListener('change', () => {
+      document.getElementById('label-mode-merge')?.classList.toggle('active', radio.value === 'merge' && radio.checked);
+      document.getElementById('label-mode-replace')?.classList.toggle('active', radio.value === 'replace' && radio.checked);
+    });
+  });
+
+  // Seleção e Drag-and-Drop de Arquivo
+  const fileInput = document.getElementById('input-import-csv');
+  const dropzone = document.getElementById('import-dropzone');
+
+  document.getElementById('btn-trigger-file')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    fileInput?.click();
+  });
+
+  dropzone?.addEventListener('click', () => fileInput?.click());
+
+  dropzone?.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropzone.classList.add('drag-over');
+  });
+
+  dropzone?.addEventListener('dragleave', () => {
+    dropzone.classList.remove('drag-over');
+  });
+
+  dropzone?.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropzone.classList.remove('drag-over');
+    const file = e.dataTransfer?.files?.[0];
+    if (file) handleImportFile(file);
+  });
+
+  fileInput?.addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    if (file) handleImportFile(file);
+    e.target.value = '';
+  });
+
+  // Importar a partir de texto colado
+  document.getElementById('btn-import-from-text')?.addEventListener('click', () => {
+    const raw = document.getElementById('textarea-import-paste')?.value || '';
+    if (!raw.trim()) {
+      showToast('Cole o conteúdo do CSV ou da tabela antes de importar.');
+      return;
+    }
+    const imported = parseProductsFromText(raw);
+    applyImportedProducts(imported);
+  });
 
   document.getElementById('btn-restore-defaults').addEventListener('click', () => {
     products = INITIAL_PRODUCTS.map(computeProductMetrics);
